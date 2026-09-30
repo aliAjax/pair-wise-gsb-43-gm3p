@@ -117,11 +117,52 @@ class ProcurementService:
                     raw_value REAL NOT NULL,
                     score REAL NOT NULL,
                     comment TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'valid',
+                    invalidated_recusal_id INTEGER,
+                    source_recusal_id INTEGER,
+                    invalidated_at TEXT,
                     version INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(bid_id,evaluation_round,evaluator,criterion)
                 );
+                CREATE TABLE IF NOT EXISTS evaluation_seats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    seat_no TEXT NOT NULL,
+                    evaluator TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(tender_id,seat_no)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_seat_one_evaluator
+                    ON evaluation_seats(tender_id,evaluator) WHERE status='active';
+                CREATE TABLE IF NOT EXISTS recusals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    seat_id INTEGER REFERENCES evaluation_seats(id),
+                    evaluation_round INTEGER NOT NULL,
+                    evaluator TEXT NOT NULL,
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'recused',
+                    declared_by TEXT NOT NULL,
+                    replacement_evaluator TEXT,
+                    handover_status TEXT NOT NULL DEFAULT 'pending',
+                    transferred_by TEXT,
+                    transferred_at TEXT,
+                    withdrawn_by TEXT,
+                    withdrawn_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_recusal_active
+                    ON recusals(tender_id,evaluator,vendor_id,evaluation_round)
+                    WHERE status IN ('recused','transferred');
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_recusal_replacement
+                    ON recusals(tender_id,replacement_evaluator) WHERE handover_status='done';
                 CREATE TABLE IF NOT EXISTS conflicts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tender_id INTEGER NOT NULL REFERENCES tenders(id),
@@ -164,8 +205,27 @@ class ProcurementService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_recusals_tender ON recusals(tender_id,vendor_id,evaluation_round);
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()}
+        if "status" not in cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN status TEXT NOT NULL DEFAULT 'valid'")
+        if "invalidated_recusal_id" not in cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN invalidated_recusal_id INTEGER")
+        if "source_recusal_id" not in cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN source_recusal_id INTEGER")
+        if "invalidated_at" not in cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN invalidated_at TEXT")
+
+    def _audit_failure(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
+                       action: str, details: dict[str, Any], error: str) -> None:
+        """审计失败尝试并立即提交，避免被业务事务回滚。"""
+        self._audit(conn, tender_id, actor, action, {**details, "result": "failed", "error": error})
+        conn.commit()
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -364,8 +424,249 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "conflict.declared", {"evaluator": evaluator.strip(), "vendor_id": vendor_id, "reason": reason.strip()})
             return dict(conn.execute("SELECT * FROM conflicts WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def assign_evaluation_seat(self, actor: str, role: str, tender_id: int,
+                               evaluator: str, seat_no: str | None = None) -> dict[str, Any]:
+        """预先把专家固定到一个评审席位；同一专家在同一项目只能占用一个席位。"""
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "分配评审席位")
+        evaluator = (evaluator or "").strip()
+        if not evaluator:
+            raise DomainError("评审专家不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] not in {"opened", "reevaluation"} or tender["evaluations_locked"]:
+                raise DomainError("当前项目不能分配评审席位", 409)
+            self._ensure_no_active_replacement(conn, tender_id, evaluator)
+            existing = conn.execute(
+                "SELECT * FROM evaluation_seats WHERE tender_id=? AND evaluator=? AND status='active'",
+                (tender_id, evaluator),
+            ).fetchone()
+            explicit_seat_no = bool(seat_no and str(seat_no).strip())
+            if existing:
+                if explicit_seat_no and str(seat_no).strip() != existing["seat_no"]:
+                    raise DomainError("该专家已占用评审席位: %s" % existing["seat_no"], 409)
+                return dict(existing)
+            if not explicit_seat_no:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM evaluation_seats WHERE tender_id=?", (tender_id,)
+                ).fetchone()
+                seat_no = "S%02d" % (row["c"] + 1)
+            seat_no = str(seat_no).strip()
+            now = utcnow()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO evaluation_seats(tender_id,seat_no,evaluator,status,created_by,created_at,updated_at)
+                       VALUES(?,?,?,'active',?,?,?)""",
+                    (tender_id, seat_no, evaluator, actor, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("席位编号重复或该专家已占用其他席位", 409) from exc
+            self._audit(conn, tender_id, actor, "seat.assigned",
+                        {"seat_id": cur.lastrowid, "seat_no": seat_no, "evaluator": evaluator})
+            return dict(conn.execute("SELECT * FROM evaluation_seats WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def declare_recusal(self, actor: str, role: str, tender_id: int, evaluator: str,
+                        vendor_id: int, reason: str) -> dict[str, Any]:
+        """开标后登记临时回避。回避一生效，该专家对该供应商本轮的有效评分立即失效但保留历史。"""
+        actor = clean_actor(actor)
+        require_role(role, {"evaluator", "procurement", "supervisor"}, "登记评审回避")
+        evaluator = (evaluator or "").strip()
+        reason = (reason or "").strip()
+        if not evaluator or not reason:
+            raise DomainError("回避专家和回避原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] not in {"opened", "reevaluation"} or tender["evaluations_locked"]:
+                raise DomainError("当前项目不能登记回避", 409)
+            vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
+            if not vendor:
+                raise DomainError("供应商不存在", 404)
+            bid = conn.execute(
+                "SELECT * FROM bids WHERE tender_id=? AND vendor_id=? AND status IN ('opened','qualified')",
+                (tender_id, vendor_id),
+            ).fetchone()
+            if not bid:
+                raise DomainError("该供应商没有可回避的有效投标", 409)
+            seat = conn.execute(
+                "SELECT * FROM evaluation_seats WHERE tender_id=? AND evaluator=? AND status='active'",
+                (tender_id, evaluator),
+            ).fetchone()
+            if not seat:
+                raise DomainError("该专家没有有效评审席位，不能回避", 409)
+            now = utcnow()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO recusals(tender_id,seat_id,evaluation_round,evaluator,vendor_id,reason,
+                                            status,declared_by,handover_status,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,'recused',?,'pending',?,?)""",
+                    (tender_id, seat["id"], tender["evaluation_round"], evaluator, vendor_id, reason, actor, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该专家对此供应商的回避记录已存在且未撤回", 409) from exc
+            recusal_id = cur.lastrowid
+            result = conn.execute(
+                """UPDATE evaluations SET status='invalidated',invalidated_recusal_id=?,invalidated_at=?,
+                       updated_at=?
+                   WHERE bid_id=? AND evaluation_round=? AND evaluator=? AND status='valid'""",
+                (recusal_id, now, now, bid["id"], tender["evaluation_round"], evaluator),
+            )
+            self._audit(conn, tender_id, actor, "recusal.declared",
+                        {"recusal_id": recusal_id, "seat_id": seat["id"], "seat_no": seat["seat_no"],
+                         "evaluator": evaluator, "vendor_id": vendor_id,
+                         "invalidated_scores": result.rowcount})
+            return dict(conn.execute("SELECT * FROM recusals WHERE id=?", (recusal_id,)).fetchone())
+
+    def withdraw_recusal(self, actor: str, role: str, recusal_id: int) -> dict[str, Any]:
+        """撤回回避：仅在交接尚未完成时允许，同时把因回避失效的原评分恢复为有效。"""
+        actor = clean_actor(actor)
+        require_role(role, {"evaluator", "procurement", "supervisor"}, "撤回评审回避")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            recusal = conn.execute("SELECT * FROM recusals WHERE id=?", (recusal_id,)).fetchone()
+            if not recusal:
+                raise DomainError("回避记录不存在", 404)
+            tender = self._tender(conn, recusal["tender_id"])
+            if tender["evaluations_locked"]:
+                raise DomainError("评分已锁定，不能撤回回避", 409)
+            if recusal["status"] == "withdrawn":
+                raise DomainError("回避记录已撤回", 409)
+            if recusal["handover_status"] == "done":
+                raise DomainError("已完成专家交接，不能撤回回避", 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE recusals SET status='withdrawn',withdrawn_by=?,withdrawn_at=?,updated_at=? WHERE id=?",
+                (actor, now, now, recusal_id),
+            )
+            result = conn.execute(
+                """UPDATE evaluations SET status='valid',invalidated_recusal_id=NULL,invalidated_at=NULL,updated_at=?
+                   WHERE invalidated_recusal_id=?""",
+                (now, recusal_id),
+            )
+            self._audit(conn, recusal["tender_id"], actor, "recusal.withdrawn",
+                        {"recusal_id": recusal_id, "restored_scores": result.rowcount})
+            return dict(conn.execute("SELECT * FROM recusals WHERE id=?", (recusal_id,)).fetchone())
+
+    def transfer_recusal(self, actor: str, role: str, recusal_id: int, replacement_evaluator: str) -> dict[str, Any]:
+        """监督员确认专家交接。条件更新保证并发确认只有一个接替人；失败后可按原回避记录重试。"""
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "确认回避交接")
+        replacement_evaluator = (replacement_evaluator or "").strip()
+        if not replacement_evaluator:
+            raise DomainError("接替专家不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            recusal = conn.execute("SELECT * FROM recusals WHERE id=?", (recusal_id,)).fetchone()
+            if not recusal:
+                raise DomainError("回避记录不存在", 404)
+            tender = self._tender(conn, recusal["tender_id"])
+            if tender["evaluations_locked"]:
+                raise DomainError("评分已锁定，不能交接", 409)
+            if recusal["status"] == "withdrawn":
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator},
+                                    "回避记录已撤回")
+                raise DomainError("回避记录已撤回，不能交接", 409)
+            if recusal["evaluation_round"] != tender["evaluation_round"]:
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator},
+                                    "回避属于历史轮次")
+                raise DomainError("回避记录属于历史评审轮次", 409)
+            if replacement_evaluator == recusal["evaluator"]:
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator},
+                                    "接替人不能与被回避专家相同")
+                raise DomainError("接替专家不能是被回避专家本人")
+            # 同一专家不能同时占用两个席位：已有有效席位，或已接手其他回避，都拒绝。
+            occupied_seat = conn.execute(
+                "SELECT seat_no FROM evaluation_seats WHERE tender_id=? AND evaluator=? AND status='active'",
+                (recusal["tender_id"], replacement_evaluator),
+            ).fetchone()
+            if occupied_seat:
+                error = "接替专家已占用评审席位: %s" % occupied_seat["seat_no"]
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator}, error)
+                raise DomainError(error, 409)
+            other = conn.execute(
+                "SELECT id FROM recusals WHERE tender_id=? AND replacement_evaluator=? AND handover_status='done' AND id<>?",
+                (recusal["tender_id"], replacement_evaluator, recusal_id),
+            ).fetchone()
+            if other:
+                error = "接替专家已接手其他回避: recusal#%s" % other["id"]
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator}, error)
+                raise DomainError(error, 409)
+            conflict = conn.execute(
+                "SELECT 1 FROM conflicts WHERE tender_id=? AND evaluator=? AND (vendor_id=? OR vendor_id IS NULL)",
+                (recusal["tender_id"], replacement_evaluator, recusal["vendor_id"]),
+            ).fetchone()
+            if conflict:
+                error = "接替专家与该供应商存在利益冲突"
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator}, error)
+                raise DomainError(error, 409)
+            if recusal["handover_status"] == "done":
+                # 交接早已完成（可能正是本次请求的重试）：保留唯一接替人，幂等返回。
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator},
+                                    "交接已完成，接替人保持为 %s" % recusal["replacement_evaluator"])
+                if replacement_evaluator != recusal["replacement_evaluator"]:
+                    raise DomainError("交接已完成，接替人不能更换为: %s" % replacement_evaluator, 409)
+                return dict(recusal)
+            now = utcnow()
+            result = conn.execute(
+                """UPDATE recusals SET status='transferred',replacement_evaluator=?,handover_status='done',
+                       transferred_by=?,transferred_at=?,updated_at=?
+                   WHERE id=? AND handover_status='pending' AND status='recused'""",
+                (replacement_evaluator, actor, now, now, recusal_id),
+            )
+            if result.rowcount != 1:
+                # 并发交接抢先成功：本次只留一个接替人，失败方可按原回避记录重试另一人。
+                winner = conn.execute("SELECT * FROM recusals WHERE id=?", (recusal_id,)).fetchone()
+                error = "交接已被其他监督员确认，接替人为 %s" % winner["replacement_evaluator"]
+                self._audit_failure(conn, recusal["tender_id"], actor, "recusal.transfer",
+                                    {"recusal_id": recusal_id, "replacement_evaluator": replacement_evaluator}, error)
+                raise DomainError(error, 409)
+            self._audit(conn, recusal["tender_id"], actor, "recusal.transferred",
+                        {"recusal_id": recusal_id, "seat_id": recusal["seat_id"],
+                         "evaluator": recusal["evaluator"], "vendor_id": recusal["vendor_id"],
+                         "replacement_evaluator": replacement_evaluator})
+            return dict(conn.execute("SELECT * FROM recusals WHERE id=?", (recusal_id,)).fetchone())
+
+    def _ensure_no_active_replacement(self, conn: sqlite3.Connection, tender_id: int, evaluator: str) -> None:
+        row = conn.execute(
+            "SELECT id FROM recusals WHERE tender_id=? AND replacement_evaluator=? AND handover_status='done'",
+            (tender_id, evaluator),
+        ).fetchone()
+        if row:
+            raise DomainError("该专家已接手回避席位，不能再占用其他评审席位", 409)
+
+    def _ensure_seat(self, conn: sqlite3.Connection, tender: sqlite3.Row, evaluator: str) -> sqlite3.Row:
+        """普通评分自动落席；已接手回避的专家不能再占独立席位。"""
+        seat = conn.execute(
+            "SELECT * FROM evaluation_seats WHERE tender_id=? AND evaluator=? AND status='active'",
+            (tender["id"], evaluator),
+        ).fetchone()
+        if seat:
+            return seat
+        self._ensure_no_active_replacement(conn, tender["id"], evaluator)
+        row = conn.execute("SELECT COUNT(*) AS c FROM evaluation_seats WHERE tender_id=?", (tender["id"],)).fetchone()
+        seat_no = "S%02d" % (row["c"] + 1)
+        now = utcnow()
+        try:
+            cur = conn.execute(
+                """INSERT INTO evaluation_seats(tender_id,seat_no,evaluator,status,created_by,created_at,updated_at)
+                   VALUES(?,?,?,'active',?,?,?)""",
+                (tender["id"], seat_no, evaluator, evaluator, now, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DomainError("该专家已占用其他评审席位", 409) from exc
+        return conn.execute("SELECT * FROM evaluation_seats WHERE id=?", (cur.lastrowid,)).fetchone()
+
     def evaluate_bid(self, actor: str, role: str, bid_id: int, values: dict[str, float],
-                     comment: str = "") -> dict[str, Any]:
+                     comment: str = "", recusal_id: int | None = None) -> dict[str, Any]:
+        """评分。普通评分按专家席位落席；recusal_id 指定回避记录时为接替专家补评。"""
         actor = clean_actor(actor)
         require_role(role, {"evaluator"}, "评分")
         with self.connect() as conn:
@@ -378,12 +679,37 @@ class ProcurementService:
                 raise DomainError("当前项目不能评分", 409)
             if bid["status"] not in {"opened", "qualified"}:
                 raise DomainError("该投标不能评分", 409)
-            conflict = conn.execute(
-                "SELECT 1 FROM conflicts WHERE tender_id=? AND evaluator=? AND (vendor_id=? OR vendor_id IS NULL)",
-                (tender["id"], actor, bid["vendor_id"]),
-            ).fetchone()
-            if conflict:
-                raise DomainError("评审人与该供应商存在利益冲突", 403)
+            source_recusal_id = None
+            if recusal_id is not None:
+                # 接替专家补评：必须凭已交接的回避记录，且只能补该回避对应供应商的投标。
+                recusal = conn.execute("SELECT * FROM recusals WHERE id=?", (int(recusal_id),)).fetchone()
+                if not recusal:
+                    raise DomainError("回避记录不存在", 404)
+                if recusal["tender_id"] != tender["id"] or recusal["vendor_id"] != bid["vendor_id"]:
+                    raise DomainError("补评投标与回避记录不匹配", 409)
+                if recusal["evaluation_round"] != tender["evaluation_round"]:
+                    raise DomainError("回避记录属于历史评审轮次，不能补评", 409)
+                if recusal["status"] != "transferred" or recusal["handover_status"] != "done":
+                    raise DomainError("回避尚未完成专家交接，不能补评", 409)
+                if recusal["replacement_evaluator"] != actor:
+                    raise DomainError("只有监督员确认的接替专家可以补评", 403)
+                source_recusal_id = recusal["id"]
+            else:
+                # 有效回避中的专家不能对该供应商评分。
+                active_recusal = conn.execute(
+                    """SELECT id FROM recusals WHERE tender_id=? AND vendor_id=? AND evaluator=?
+                       AND evaluation_round=? AND status IN ('recused','transferred')""",
+                    (tender["id"], bid["vendor_id"], actor, tender["evaluation_round"]),
+                ).fetchone()
+                if active_recusal:
+                    raise DomainError("该专家已回避此供应商，不能评分", 403)
+                conflict = conn.execute(
+                    "SELECT 1 FROM conflicts WHERE tender_id=? AND evaluator=? AND (vendor_id=? OR vendor_id IS NULL)",
+                    (tender["id"], actor, bid["vendor_id"]),
+                ).fetchone()
+                if conflict:
+                    raise DomainError("评审人与该供应商存在利益冲突", 403)
+                self._ensure_seat(conn, tender, actor)
             criteria = json.loads(tender["criteria"])
             missing = [c["name"] for c in criteria if c["name"] not in values]
             if missing:
@@ -409,13 +735,19 @@ class ProcurementService:
                 if existing:
                     raise DomainError("该评分项已提交，不能覆盖", 409)
                 cur = conn.execute(
-                    """INSERT INTO evaluations(bid_id,evaluation_round,evaluator,criterion,raw_value,score,comment,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (bid_id, tender["evaluation_round"], actor, criterion["name"], raw, score, comment.strip(), now, now),
+                    """INSERT INTO evaluations(bid_id,evaluation_round,evaluator,criterion,raw_value,score,comment,
+                                               status,source_recusal_id,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,'valid',?,?,?)""",
+                    (bid_id, tender["evaluation_round"], actor, criterion["name"], raw, score, comment.strip(),
+                     source_recusal_id, now, now),
                 )
                 created.append(dict(conn.execute("SELECT * FROM evaluations WHERE id=?", (cur.lastrowid,)).fetchone()))
-            self._audit(conn, tender["id"], actor, "bid.evaluated", {"bid_id": bid_id, "criteria": [item["criterion"] for item in created]})
-            return {"bid_id": bid_id, "evaluator": actor, "round": tender["evaluation_round"], "evaluations": created}
+            action = "bid.reevaluated_after_recusal" if source_recusal_id else "bid.evaluated"
+            self._audit(conn, tender["id"], actor, action,
+                        {"bid_id": bid_id, "criteria": [item["criterion"] for item in created],
+                         "recusal_id": source_recusal_id})
+            return {"bid_id": bid_id, "evaluator": actor, "round": tender["evaluation_round"],
+                    "recusal_id": source_recusal_id, "evaluations": created}
 
     def disqualify_bid(self, actor: str, role: str, bid_id: int, reason: str,
                        expected_version: int) -> dict[str, Any]:
@@ -514,6 +846,77 @@ class ProcurementService:
             self._audit(conn, complaint["tender_id"], actor, "complaint.resolved", {"complaint_id": complaint_id, "decision": decision})
             return dict(conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone())
 
+    def _review_trace(self, conn: sqlite3.Connection, tender: sqlite3.Row) -> dict[int, dict[str, Any]]:
+        """按供应商还原回避、失效评分和补评结果，供授标校验、页面和审计快照共用。"""
+        rows = conn.execute(
+            "SELECT id,vendor_id FROM bids WHERE tender_id=? ORDER BY id", (tender["id"],)
+        ).fetchall()
+        recusals = conn.execute(
+            """SELECT * FROM recusals WHERE tender_id=? ORDER BY id""",
+            (tender["id"],),
+        ).fetchall()
+        trace: dict[int, dict[str, Any]] = {}
+        for bid_row in rows:
+            trace[bid_row["vendor_id"]] = {
+                "bid_id": bid_row["id"],
+                "recusals": [],
+                "valid_evaluations": [],
+                "invalidated_evaluations": [],
+                "replacement_evaluations": [],
+            }
+        for recusal in recusals:
+            item = trace.get(recusal["vendor_id"])
+            if item is None:
+                continue
+            item["recusals"].append({
+                "id": recusal["id"],
+                "round": recusal["evaluation_round"],
+                "seat_id": recusal["seat_id"],
+                "evaluator": recusal["evaluator"],
+                "vendor_id": recusal["vendor_id"],
+                "reason": recusal["reason"],
+                "status": recusal["status"],
+                "replacement_evaluator": recusal["replacement_evaluator"],
+                "handover_status": recusal["handover_status"],
+                "transferred_by": recusal["transferred_by"],
+                "transferred_at": recusal["transferred_at"],
+                "withdrawn_by": recusal["withdrawn_by"],
+                "withdrawn_at": recusal["withdrawn_at"],
+                "created_at": recusal["created_at"],
+            })
+        evaluations = conn.execute(
+            """SELECT e.*, b.vendor_id FROM evaluations e JOIN bids b ON b.id=e.bid_id
+               WHERE b.tender_id=? ORDER BY e.id""",
+            (tender["id"],),
+        ).fetchall()
+        for evaluation in evaluations:
+            item = trace.get(evaluation["vendor_id"])
+            if item is None:
+                continue
+            payload = {
+                "id": evaluation["id"],
+                "bid_id": evaluation["bid_id"],
+                "round": evaluation["evaluation_round"],
+                "evaluator": evaluation["evaluator"],
+                "criterion": evaluation["criterion"],
+                "raw_value": evaluation["raw_value"],
+                "score": evaluation["score"],
+                "comment": evaluation["comment"],
+                "status": evaluation["status"],
+                "invalidated_recusal_id": evaluation["invalidated_recusal_id"],
+                "source_recusal_id": evaluation["source_recusal_id"],
+                "invalidated_at": evaluation["invalidated_at"],
+                "created_at": evaluation["created_at"],
+            }
+            if evaluation["status"] == "invalidated":
+                item["invalidated_evaluations"].append(payload)
+            elif evaluation["source_recusal_id"] is not None:
+                item["replacement_evaluations"].append(payload)
+                item["valid_evaluations"].append(payload)
+            else:
+                item["valid_evaluations"].append(payload)
+        return trace
+
     def award_tender(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "授标")
@@ -530,11 +933,31 @@ class ProcurementService:
             bids = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender_id,)).fetchall()
             criteria = json.loads(tender["criteria"])
             expected_criteria = {c["name"] for c in criteria}
+            trace = self._review_trace(conn, tender)
+            current_round = tender["evaluation_round"]
             ranking = []
             for bid in bids:
+                item = trace.get(bid["vendor_id"], {"recusals": [], "valid_evaluations": []})
+                # 回避流程必须在该供应商身上闭合：无待交接回避，且每次已交接回避都已由接替人补齐本轮全部评分。
+                pending = [r for r in item["recusals"]
+                           if r["round"] == current_round and r["status"] == "recused" and r["handover_status"] == "pending"]
+                if pending:
+                    raise DomainError("供应商(id=%s)存在未完成专家交接的回避，不能授标" % bid["vendor_id"], 409)
+                transferred = [r for r in item["recusals"]
+                               if r["round"] == current_round and r["status"] == "transferred" and r["handover_status"] == "done"]
+                for recusal in transferred:
+                    filled = {e["criterion"] for e in item["valid_evaluations"]
+                              if e["round"] == current_round and e["source_recusal_id"] == recusal["id"]
+                              and e["evaluator"] == recusal["replacement_evaluator"]}
+                    missing_repair = sorted(expected_criteria - filled)
+                    if missing_repair:
+                        raise DomainError(
+                            "供应商(id=%s)回避补评未完成，缺少评分项: %s" % (bid["vendor_id"], ",".join(missing_repair)), 409)
+                # 失效评分（status='invalidated'）不参与汇总，只有有效评分计入平均分。
                 rows = conn.execute(
-                    "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
-                    (bid["id"], tender["evaluation_round"]),
+                    """SELECT criterion,AVG(score) AS score FROM evaluations
+                       WHERE bid_id=? AND evaluation_round=? AND status='valid' GROUP BY criterion""",
+                    (bid["id"], current_round),
                 ).fetchall()
                 scores = {row["criterion"]: row["score"] for row in rows}
                 if set(scores) != expected_criteria:
@@ -547,7 +970,19 @@ class ProcurementService:
                 raise DomainError("没有可授标的有效投标", 409)
             ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
             winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            review_summary = {
+                str(vendor_id): {
+                    "recusals": [{"id": r["id"], "evaluator": r["evaluator"], "status": r["status"],
+                                  "replacement_evaluator": r["replacement_evaluator"],
+                                  "handover_status": r["handover_status"]}
+                                 for r in item["recusals"] if r["round"] == current_round],
+                    "invalidated_count": len([e for e in item["invalidated_evaluations"] if e["round"] == current_round]),
+                    "replacement_count": len([e for e in item["replacement_evaluations"] if e["round"] == current_round]),
+                }
+                for vendor_id, item in trace.items()
+            }
+            snapshot = {"tender_id": tender_id, "round": current_round, "ranking": ranking, "winner": winner,
+                        "recusal_review": review_summary, "awarded_by": actor, "awarded_at": utcnow()}
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
                 (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
@@ -582,7 +1017,17 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            result: dict[str, Any] = {"tender": tender, "bids": bids, "clarifications": clarifications}
+            if role in {"procurement", "supervisor", "auditor"} and tender["status"] in {"opened", "reevaluation", "awarded"}:
+                result["evaluation_seats"] = [dict(r) for r in conn.execute(
+                    "SELECT * FROM evaluation_seats WHERE tender_id=? ORDER BY id", (tender_id,)
+                ).fetchall()]
+                result["recusals"] = [dict(r) for r in conn.execute(
+                    "SELECT * FROM recusals WHERE tender_id=? ORDER BY id", (tender_id,)
+                ).fetchall()]
+                # 按供应商还原回避、失效评分与接替补评，页面与审计共用同一视图。
+                result["review_trace"] = {str(k): v for k, v in self._review_trace(conn, tender).items()}
+            return result
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
@@ -704,6 +1149,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.declare_conflict(actor, role, **data)
             elif path == "/api/evaluations":
                 result = self.service.evaluate_bid(actor, role, **data)
+            elif path == "/api/evaluation-seats":
+                result = self.service.assign_evaluation_seat(actor, role, **data)
+            elif path == "/api/recusals":
+                result = self.service.declare_recusal(actor, role, **data)
+            elif path == "/api/recusals/withdraw":
+                result = self.service.withdraw_recusal(actor, role, **data)
+            elif path == "/api/recusals/transfer":
+                result = self.service.transfer_recusal(actor, role, **data)
             elif path == "/api/bids/disqualify":
                 result = self.service.disqualify_bid(actor, role, **data)
             elif path == "/api/clarifications":
