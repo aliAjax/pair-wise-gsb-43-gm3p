@@ -1,6 +1,65 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>公共采购密封投标</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>公共采购密封投标与评审</h1><div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}
+table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px;vertical-align:top}th{background:#eef4f7}
+.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px;margin:12px 0}
+code{background:#edf0f2;padding:2px 5px}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+.active{background:#23845b}.recused{background:#b1553f}.handover_pending{background:#b5862b}.invalidated{background:#8a9299}.pending{background:#b5862b}.valid{background:#23845b}.revoked{background:#8a9299}.failed{background:#b1553f}.confirmed{background:#23845b}
+.blocked{background:#fbeee9;border-left:5px solid #b1553f;padding:10px 14px;margin:10px 0}
+select,input{padding:5px 8px;margin-right:8px}
+.muted{color:#75808a;font-size:13px}
+</style>
+<h1>公共采购密封投标与评审</h1>
+<div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。写接口需要 <code>X-User</code>、<code>X-Role</code>。
+开标后专家临时回避时，相关评分立即失效但保留历史，监督员确认交接后由接替人补评；缺项或未交接的供应商会被挡住授标，其他供应商不受影响。</div>
+<label>查看身份
+<select id="role">
+<option value="public">公开访问</option>
+<option value="procurement">采购方</option>
+<option value="supervisor">监督员</option>
+<option value="auditor" selected>审计员</option>
+<option value="vendor">供应商</option>
+</select></label>
+<label>用户 <input id="user" value="aud1" size="10"></label>
 <h2>采购项目</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>版本</th></tr></thead><tbody></tbody></table>
 <h2>投标元数据</h2><table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${r.payload_hash.slice(0,12)}…</td></tr>`).join('')}load()</script></html>
+<h2>回避与评审席位（按供应商还原）</h2><div id="review" class="muted">监督员/采购/审计身份可查看每个供应商的回避记录、失效历史、席位交接与补评结果。</div>
+<script>
+function badge(t){return `<span class="badge ${t}">${t}</span>`}
+async function load(){
+  const role=document.querySelector('#role').value, user=document.querySelector('#user').value||'x';
+  const d=await fetch('/api/state',{headers:{'X-Role':role,'X-User':user}}).then(r=>r.json());
+  document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');
+  document.querySelector('#bids tbody').innerHTML=(d.bids||[]).map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td><code>${(r.payload_hash||'').slice(0,12)}…</code></td></tr>`).join('');
+  const box=document.querySelector('#review');
+  if(!['procurement','supervisor','auditor'].includes(role)){box.innerHTML='<span class="muted">当前身份无权查看评审席位还原。</span>';return}
+  const opened=d.tenders.filter(t=>['opened','reevaluation','awarded'].includes(t.status));
+  if(!opened.length){box.innerHTML='<span class="muted">暂无开标后的项目。</span>';return}
+  box.innerHTML='';
+  for(const t of opened){
+    const detail=await fetch(`/api/tenders/${t.id}/review`,{headers:{'X-Role':role,'X-User':user}}).then(r=>r.json());
+    const h=document.createElement('div');h.className='card';
+    h.innerHTML=`<h3>${t.tender_no} ${t.title}（第${detail.evaluation_round}轮）</h3>`+
+      detail.vendors.map(v=>{
+        const gate=v.ready?'<b style="color:#23845b">可授标</b>':`<div class="blocked"><b>授标拦截：</b>${v.blockers.join('；')}</div>`;
+        const rec=v.recusals.map(r=>`回避 #${r.id} ${r.evaluator} ${r.vendor_id?'供应商'+r.vendor_id:'全场'} ${badge(r.status)}<br><span class="muted">${r.reason}</span>`).join('<br>')||'<span class="muted">无</span>';
+        const seats=v.seats.map(s=>{
+          const evals=s.evaluations.map(e=>`<tr><td>${e.criterion}</td><td>${e.evaluator}</td><td>${e.raw_value}</td><td>${badge(e.status)}</td><td class="muted">${e.invalidation_reason||''}</td></tr>`).join('');
+          const hands=s.handovers.map(x=>`交接 #${x.id}：${x.previous_evaluator} → ${x.replacement_evaluator} ${badge(x.status)}${x.failure_reason?' <span class="muted">'+x.failure_reason+'</span>':''}`).join('<br>')||'<span class="muted">无交接</span>';
+          return `<div><b>席位 ${s.seat.seat_no}</b>：${s.seat.original_evaluator} → ${s.seat.evaluator} ${badge(s.seat.status)}
+            ${s.missing_criteria.length?'<div class="muted">待补评分项：'+s.missing_criteria.join('、')+'</div>':''}
+            <div class="muted">${hands}</div>
+            <table style="margin:6px 0"><thead><tr><th>评分项</th><th>专家</th><th>原始值</th><th>状态</th><th>说明</th></tr></thead><tbody>${evals}</tbody></table></div>`;
+        }).join('')||'<span class="muted">暂无席位</span>';
+        const inv=v.invalidated_evaluations.length?`<details><summary>已失效历史评分（${v.invalidated_evaluations.length}）</summary><table><thead><tr><th>评分项</th><th>专家</th><th>失效时间</th><th>原因</th></tr></thead><tbody>${v.invalidated_evaluations.map(e=>`<tr><td>${e.criterion}</td><td>${e.evaluator}</td><td>${e.invalidated_at||''}</td><td>${e.invalidation_reason||''}</td></tr>`).join('')}</tbody></table></details>`:'';
+        h.innerHTML+=`<table><tbody><tr><td style="width:18%"><b>供应商</b><br>${v.vendor.name||v.vendor.id}（投标#${v.bid.id}，${v.bid.status}）</td>
+          <td style="width:22%"><b>回避记录</b><br>${rec}</td>
+          <td><b>席位 / 交接 / 补评</b><br>${seats}${inv}</td></tr></tbody></table>${gate}`;
+      }).join('');
+    box.appendChild(h);
+  }
+}
+document.querySelector('#role').addEventListener('change',load);
+load();
+</script></html>
